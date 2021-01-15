@@ -5,17 +5,13 @@ import io.kaicode.elasticvc.api.BranchService;
 import io.kaicode.elasticvc.api.CommitListener;
 import io.kaicode.elasticvc.domain.Commit;
 import org.elasticsearch.index.query.MatchAllQueryBuilder;
-import org.junit.Assert;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.snomed.snowstorm.AbstractTest;
 import org.snomed.snowstorm.TestConfig;
 import org.snomed.snowstorm.config.Config;
-import org.snomed.snowstorm.core.data.domain.Concept;
-import org.snomed.snowstorm.core.data.domain.ConceptMini;
-import org.snomed.snowstorm.core.data.domain.QueryConcept;
-import org.snomed.snowstorm.core.data.domain.Relationship;
+import org.snomed.snowstorm.core.data.domain.*;
 import org.snomed.snowstorm.core.data.services.transitiveclosure.GraphBuilderException;
 import org.snomed.snowstorm.mrcm.MRCMUpdateService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -32,8 +28,7 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 import static io.kaicode.elasticvc.api.ComponentService.LARGE_PAGE;
-import static org.junit.Assert.*;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.snomed.snowstorm.core.data.domain.Concepts.*;
 
 @ExtendWith(SpringExtension.class)
@@ -211,22 +206,24 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 		conceptService.batchCreate(Lists.newArrayList(root, toppingAttribute, cheeseTopping, hamTopping, pizza, cheesePizza, hamPizza), branch);
 
 		String ecl = "<<" + root.getId();
-		assertEquals(7, eclSearch(ecl, branch).getTotalElements());
+		assertEquals(7, eclSearchForIds(ecl, branch).size());
 		String eclAnyConceptWithATopping = "<" + root.getId() + ":" + toppingAttribute.getId() + "=*";
-		assertEquals("Should find 1 pizza with a topping", 1, eclSearch(eclAnyConceptWithATopping, branch).getTotalElements());
+		assertEquals(1, eclSearchForIds(eclAnyConceptWithATopping, branch).size(), "Should find 1 pizza with a topping");
 		assertTC(hamPizza, pizza, root);
 
 		// Add a topping to ham pizza
 		hamPizza.addRelationship(new Relationship(toppingAttribute.getId(), hamTopping.getId()));
 		conceptService.update(hamPizza, branch);
 
-		assertEquals("Should now find 2 pizzas with a topping", 2, eclSearch(eclAnyConceptWithATopping, branch).getTotalElements());
+		assertEquals(2, eclSearchForIds(eclAnyConceptWithATopping, branch).size(), "Should now find 2 pizzas with a topping");
 
 		assertTC(hamPizza, pizza, root);
 	}
 
-	private Page<ConceptMini> eclSearch(String ecl, String branch) {
-		return queryService.search(queryService.createQueryBuilder(false).ecl(ecl), branch, LARGE_PAGE);
+	private List<String> eclSearchForIds(String ecl, String branch) {
+		return queryService.search(queryService.createQueryBuilder(false).ecl(ecl), branch, LARGE_PAGE).getContent().stream()
+				.map(ConceptMini::getConceptId)
+				.collect(Collectors.toList());
 	}
 
 	@Test
@@ -333,7 +330,7 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 	}
 
 	@Test
-	void testRemoveSecondInferredIsAOnChildBranch() throws ServiceException {
+	void testDeleteSecondInferredIsAOnChildBranch() throws ServiceException {
 		Concept root = new Concept(SNOMEDCT_ROOT);
 
 		Concept n11 = new Concept("1000011").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
@@ -359,6 +356,40 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 		assertTrue(relationships.remove(relationshipToDelete));
 		assertEquals(1, relationships.size());
 		n14 = conceptService.update(n14, branch);
+		assertEquals(1, n14.getRelationships().size());
+
+		assertTC(n14, branch, n12, n11, root);
+		assertEquals(1, queryService.eclSearch(">!" + n14.getId(), false, branch, LARGE_PAGE).getTotalElements());
+	}
+
+	@Test
+	void testInactivateSecondInferredIsAOnChildBranch() throws ServiceException {
+		Concept root = new Concept(SNOMEDCT_ROOT);
+
+		Concept n11 = new Concept("1000011").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
+		Concept n12 = new Concept("1000012").addRelationship(new Relationship(ISA, n11.getId()));
+		Concept n13 = new Concept("1000013").addRelationship(new Relationship(ISA, n12.getId()));
+		Concept n14 = new Concept("1000014").addRelationship(new Relationship(ISA, n13.getId())).addRelationship(new Relationship(ISA, n12.getId()));
+
+		String branch = "MAIN/ABC";
+		branchService.create(branch);
+		conceptService.batchCreate(Lists.newArrayList(root, n11, n12, n13, n14), branch);
+
+		assertTC(n14, branch, n13, n12, n11, root);
+
+		branch = "MAIN/ABC/ABC-1";
+		branchService.create(branch);
+
+		n14 = conceptService.find(n14.getId(), branch);
+		Set<Relationship> relationships = n14.getRelationships();
+		assertEquals(2, relationships.size());
+		Optional<Relationship> relationshipOptional = relationships.stream().filter(r -> r.getDestinationId().equals("1000013")).findFirst();
+		assertTrue(relationshipOptional.isPresent());
+		Relationship relationshipToMakeInactive = relationshipOptional.get();
+		relationshipToMakeInactive.setActive(false);
+		assertEquals(2, relationships.size());
+		n14 = conceptService.update(n14, branch);
+		assertEquals(2, n14.getRelationships().size());
 
 		assertTC(n14, branch, n12, n11, root);
 		assertEquals(1, queryService.eclSearch(">!" + n14.getId(), false, branch, LARGE_PAGE).getTotalElements());
@@ -380,10 +411,10 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 	void testCircularReferenceCreatedDuringRebaseDoesNotBreak() throws ServiceException {
 		// On MAIN
 		Concept root = new Concept(SNOMEDCT_ROOT);
-		Concept cA = new Concept("1000011").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
-		Concept cB = new Concept("1000012").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
+		Concept cA = new Concept("1000000").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
+		Concept cB = new Concept("2000000").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
 		// C -> B
-		Concept cC = new Concept("1000013").addRelationship(new Relationship(ISA, cB.getId()));
+		Concept cC = new Concept("3000000").addRelationship(new Relationship(ISA, cB.getId()));
 		conceptService.batchCreate(Lists.newArrayList(root, cA, cB, cC), "MAIN");
 
 		// On MAIN/A
@@ -397,11 +428,69 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 		cA.addRelationship(new Relationship(ISA, cC.getId()));
 		conceptService.update(cA, "MAIN");
 
+		cA = conceptService.find(cA.getId(), "MAIN");
+		assertEquals(2, cA.getRelationships().size());
+		assertEquals(1, cA.getRelationshipsWithDestination(SNOMEDCT_ROOT).size());
+		assertEquals(1, cA.getRelationshipsWithDestination(cC.getId()).size());
+
+		cA = conceptService.find(cA.getId(), "MAIN/A");
+		assertEquals(1, cA.getRelationships().size());
+		assertEquals(1, cA.getRelationshipsWithDestination(SNOMEDCT_ROOT).size());
+
 		// Rebase causes the loop
 		branchMergeService.mergeBranchSync("MAIN", "MAIN/A", Collections.emptySet());
 
-		Page<ConceptMini> concepts = queryService.eclSearch(">1000012", false, "MAIN/A", PageRequest.of(0, 10));
-		assertEquals("[138875005, 1000013, 1000011]", concepts.getContent().stream().map(ConceptMini::getConceptId).collect(Collectors.toList()).toString());
+		cA = conceptService.find(cA.getId(), "MAIN/A");
+		assertEquals(2, cA.getRelationships().size());
+		assertEquals(1, cA.getRelationshipsWithDestination(SNOMEDCT_ROOT).size());
+		assertEquals(1, cA.getRelationshipsWithDestination(cC.getId()).size());
+
+		// Expecting loop B -> A -> C -> B
+		assertEquals("[" + SNOMEDCT_ROOT + ", " + cC.getId() + ", " + cA.getId() + "]", eclSearchForIds(">" + cB.getId(), "MAIN/A").toString());
+	}
+
+	@Test
+	void testSwapParentsMustNotCreateCircularReference() throws ServiceException {
+		// On MAIN
+		Concept root = new Concept(SNOMEDCT_ROOT);
+		Concept isA = new Concept(ISA).addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
+		// A -> root
+		Concept cA = new Concept("1001000").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
+		// B -> A
+		Concept cB = new Concept("1002000").addRelationship(new Relationship(ISA, cA.getId()));
+		// C -> A
+		Concept cC = new Concept("1003000").addRelationship(new Relationship(ISA, cA.getId()));
+
+		conceptService.batchCreate(Lists.newArrayList(root, isA, cA, cB, cC), "MAIN");
+
+		// On MAIN/A
+		// C -> B
+		branchService.create("MAIN/A");
+		cC.addRelationship(new Relationship(ISA, cB.getId()));
+		conceptService.update(cC, "MAIN/A");
+
+		// On MAIN
+		// B -> C
+		cB.addRelationship(new Relationship(ISA, cC.getId()));
+		conceptService.update(cB, "MAIN");
+
+		// Rebase MAIN/A
+		// Introduces a transitive closure loop but will be fixed in MAIN/A
+		branchMergeService.mergeBranchSync("MAIN", "MAIN/A", Collections.emptySet());
+
+		// Remove C -> B
+		cC.getRelationships(true, ISA, cB.getId(), Concepts.INFERRED_RELATIONSHIP).forEach(relationship -> relationship.setActive(false));
+		conceptService.update(cC, "MAIN/A");
+
+		// Update from C -> B -> A
+		// Update to   B -> C -> A
+		// C -> A
+		cC.getRelationships().iterator().next().setActive(false);
+		cC.addRelationship(new Relationship(ISA, cA.getId()));
+		conceptService.update(cC, "MAIN/A");
+
+//		assertEquals("[" + cA.getId() + "]", eclSearchForIds(">! " + cC.getId(), "MAIN/A").toString());
+		assertEquals("[" + cC.getId() + ", 1001000]", eclSearchForIds(">! " + cB.getId(), "MAIN/A").toString());
 	}
 
 	@Test
@@ -501,9 +590,9 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 	@Test
 	void testGetParentPaths() {
-		Assert.assertEquals("[]", updateService.getParentPaths("MAIN").toString());
-		Assert.assertEquals("[MAIN]", updateService.getParentPaths("MAIN/ONE").toString());
-		Assert.assertEquals("[MAIN/ONE, MAIN]", updateService.getParentPaths("MAIN/ONE/ONE-123").toString());
+		assertEquals("[]", updateService.getParentPaths("MAIN").toString());
+		assertEquals("[MAIN]", updateService.getParentPaths("MAIN/ONE").toString());
+		assertEquals("[MAIN/ONE, MAIN]", updateService.getParentPaths("MAIN/ONE/ONE-123").toString());
 	}
 
 	@Test
@@ -533,7 +622,8 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 		String branch = "MAIN";
 		conceptService.batchCreate(concepts, branch);
 
-		assertEquals("Total concepts should be 51", 51, queryService.search(queryService.createQueryBuilder(false).ecl("<<" + SNOMEDCT_ROOT), branch, QueryService.PAGE_OF_ONE).getTotalElements());
+		assertEquals(51, queryService.search(queryService.createQueryBuilder(false).ecl("<<" + SNOMEDCT_ROOT), branch, QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Total concepts should be 51");
 
 		List<Relationship> relationshipVersions = new ArrayList<>();
 		for (int conceptId = 0; conceptId < 50; conceptId++) {
@@ -552,7 +642,8 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 			commit.markSuccessful();
 		}
 
-		assertEquals("Total concepts should be 51", 51, queryService.search(queryService.createQueryBuilder(false).ecl("<<" + SNOMEDCT_ROOT), branch, QueryService.PAGE_OF_ONE).getTotalElements());
+		assertEquals(51, queryService.search(queryService.createQueryBuilder(false).ecl("<<" + SNOMEDCT_ROOT), branch, QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Total concepts should be 51");
 	}
 
 	@Test
@@ -704,8 +795,8 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 		// Create child branch
 		branchService.create(extensionBranch);
-		assertEquals("Concept exists on child branch",
-				1, queryService.search(queryService.createQueryBuilder(false).ecl("<" + CLINICAL_FINDING), extensionBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("<" + CLINICAL_FINDING), extensionBranch, QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Concept exists on child branch");
 
 		// On the parent branch inactivate the concept parents and add another
 		concept.getRelationships().forEach(relationship -> relationship.setActive(false));
@@ -753,8 +844,8 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 		// Create grandchild branch
 		branchService.create(extensionProjectBranch);
-		assertEquals("Concept exists on grandchild branch",
-				1, queryService.search(queryService.createQueryBuilder(false).ecl("<" + CLINICAL_FINDING), extensionProjectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("<" + CLINICAL_FINDING), extensionProjectBranch, QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Concept exists on grandchild branch");
 
 		// Grandchild branch is still on the original version of the concept.
 		// Make the relationship to root inactive - should still have the parent to clinical finding after that
@@ -787,18 +878,19 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 		// Create child branch
 		branchService.create(projectBranch);
-		assertEquals("Concept exists on child branch",
-				1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Concept exists on child branch");
 
 		// On the child branch add another attribute
 		Concept concept = conceptService.find("100100000001", projectBranch);
 		concept.getRelationships().add(new Relationship(FINDING_SITE, "100300000001").setInferred(true));
 		conceptService.update(concept, projectBranch);
 
-		assertEquals("Concept exists on child branch",
-				1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
-		assertEquals("Concept has attribute in semantic index on child branch",
-				1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001 : " + FINDING_SITE + " = 100300000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Concept exists on child branch");
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001 : " + FINDING_SITE + " = 100300000001"), projectBranch,
+				QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Concept has attribute in semantic index on child branch");
 
 		// Remove attribute from concept
 		concept = conceptService.find("100100000001", projectBranch);
@@ -807,10 +899,11 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 				.collect(Collectors.toSet()));
 		conceptService.update(concept, projectBranch);
 
-		assertEquals("Concept exists on child branch",
-				1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
-		assertEquals("Concept does not have attribute in semantic index on child branch",
-				0, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001 : " + FINDING_SITE + " = 100300000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Concept exists on child branch");
+		assertEquals(0, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001 : " + FINDING_SITE + " = 100300000001"), projectBranch,
+				QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Concept does not have attribute in semantic index on child branch");
 
 		// Make a commit on MAIN
 		conceptService.create(new Concept("100400000001").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setInferred(true)), path);
@@ -821,8 +914,8 @@ class SemanticIndexUpdateServiceTest extends AbstractTest {
 		}
 
 		// This fails before the fix for MAINT-1501
-		assertEquals("Concept exists on child branch",
-				1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("100100000001"), projectBranch, QueryService.PAGE_OF_ONE).getTotalElements(),
+				"Concept exists on child branch");
 	}
 
 	private void simulateRF2Import(String path, List<Concept> concepts) {
