@@ -49,3 +49,7 @@ On subsequent runs just start Snowstorm (in read only mode).
 ```bash
 java -Xms2g -Xmx4g -jar target/snowstorm*.jar --snowstorm.rest-api.readonly=true
 ```
+For Powershell Users
+```bash
+java -Xms2g -Xmx4g -jar "target/<SNOMED-JAR-NAME>.jar" --snowstorm.rest-api.readonly=true
+```
